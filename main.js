@@ -1,8 +1,14 @@
+/**
+ * 针对 DV/MTS 优化的 iPhone 专用转码逻辑
+ * 重点：修复像素格式兼容性、音频编码及隔行扫描问题
+ */
+
 const { createFFmpeg, fetchFile } = FFmpeg;
 
 // 初始化 FFmpeg 实例
 const ffmpeg = createFFmpeg({
     log: true,
+    // 使用稳定的核心库地址
     corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
 });
 
@@ -12,60 +18,82 @@ const progressBar = document.getElementById('progress-bar');
 const progBox = document.getElementById('prog-box');
 const player = document.getElementById('player');
 
-uploader.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
+// 核心转换函数
+async function transcode(file) {
     try {
-        status.innerText = "正在初始化引擎...";
-        if (!ffmpeg.isLoaded()) await ffmpeg.load();
+        // 1. 加载引擎
+        if (!ffmpeg.isLoaded()) {
+            status.innerText = "⏳ 正在初始化转码引擎...";
+            await ffmpeg.load();
+        }
 
-        status.innerText = "读取文件中...";
+        // 2. 清理之前的残余文件，释放内存
+        try {
+            ffmpeg.FS('unlink', 'input.mts');
+            ffmpeg.FS('unlink', 'output.mp4');
+        } catch (e) {}
+
+        // 3. 读取文件到内存
+        status.innerText = "📂 正在读取 DV 原始文件...";
+        const data = await file.arrayBuffer();
+        ffmpeg.FS('writeFile', 'input.mts', new Uint8Array(data));
+
+        // 4. 开始转码
         progBox.style.display = 'block';
-        
-        // 写入虚拟文件系统
-        ffmpeg.FS('writeFile', 'input.mts', await fetchFile(file));
+        status.innerText = "⚙️ 正在进行兼容性转码 (请保持屏幕常亮)...";
 
-        status.innerText = "正在转码... 请勿关闭页面";
-        
-        // 进度监听
         ffmpeg.setProgress(({ ratio }) => {
-            progressBar.style.width = `${(ratio * 100).toFixed(0)}%`;
+            progressBar.style.width = `${Math.floor(ratio * 100)}%`;
         });
 
-        /* 核心转换指令：
-           -i input.mts: 输入文件
-           -c:v libx264: 强制转为 H.264 编码（iPhone 兼容性最好）
-           -preset ultrafast: 牺牲一点体积换取极快的转码速度
-           -pix_fmt yuv420p: 确保 iPhone 视频播放器能打开
-           -c:a aac: 音频转为 AAC 格式
-        */
+        /**
+         * 修复“无法打开”的核心参数解析：
+         * -vf "yadif,format=yuv420p": yadif 去除 DV 横纹；format=yuv420p 强制使用 iOS 兼容的色彩空间
+         * -c:v libx264: 使用标准的 H.264 编码
+         * -profile:v main -level 4.0: 限制编码等级，确保旧款 iPhone 也能硬件解码
+         * -c:a aac -b:a 128k: 将 DV 的 AC3/PCM 音频转为标准的 AAC
+         * -movflags faststart: 将元数据置于文件头，确保视频能被 iOS 快速识别和播放
+         */
         await ffmpeg.run(
-            '-i', 'input.mts', 
-            '-c:v', 'libx264', 
-            '-preset', 'ultrafast', 
-            '-pix_fmt', 'yuv420p', 
-            '-c:a', 'aac', 
+            '-i', 'input.mts',
+            '-vf', 'yadif,format=yuv420p',
+            '-c:v', 'libx264',
+            '-profile:v', 'main',
+            '-level', '4.0',
+            '-preset', 'ultrafast', // 使用最快预设，减少浏览器假死几率
+            '-crf', '26',           // 质量系数，26 在手机端画质很好且体积较小
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', 'faststart',
             'output.mp4'
         );
 
-        status.innerText = "转码完成！正在生成预览...";
+        // 5. 生成结果
+        status.innerText = "🎉 转码成功！正在生成预览...";
+        const outputData = ffmpeg.FS('readFile', 'output.mp4');
         
-        // 读取转码后的文件
-        const data = ffmpeg.FS('readFile', 'output.mp4');
-        const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+        // 检查文件是否生成成功
+        if (outputData.length < 1000) throw new Error("转码输出异常，文件过小");
+
+        const url = URL.createObjectURL(new Blob([outputData.buffer], { type: 'video/mp4' }));
         
-        // 显示结果
         player.src = url;
         player.style.display = 'block';
-        status.innerHTML = `✅ 转换成功！<br>长按上方视频选择“保存到照片”`;
+        
+        status.innerHTML = `✅ 转换完成！<br>请<strong>长按下方视频</strong>选择“保存到照片”`;
 
-        // 自动清理内存
+        // 6. 内存清理
         ffmpeg.FS('unlink', 'input.mts');
-        ffmpeg.FS('unlink', 'output.mp4');
 
     } catch (err) {
         console.error(err);
-        status.innerText = "发生错误: " + err.message;
+        status.innerHTML = `❌ 出错了: ${err.message}<br>提示：如果文件超过 500MB，建议裁剪后再转。`;
+    }
+}
+
+// 监听上传事件
+uploader.addEventListener('change', (e) => {
+    if (e.target.files[0]) {
+        transcode(e.target.files[0]);
     }
 });
